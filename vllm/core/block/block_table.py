@@ -212,7 +212,7 @@ class BlockTable:
                     prev_block=self._blocks[-1],
                     device=device,
                     extra_hash=extra_hash))
-
+    # fork一份 blockTable
     def fork(self) -> "BlockTable":
         """Creates a new BlockTable instance with a copy of the blocks from the
         current instance.

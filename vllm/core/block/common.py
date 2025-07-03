@@ -360,7 +360,6 @@ class CacheMetricData:
             incompleted_block_hit = (incompleted_hit_rate * incomplete_ratio)
         return (completed_block_hit + incompleted_block_hit) / total_blocks
 
-
 def get_all_blocks_recursively(last_block: Block) -> List[Block]:
     """Retrieves all the blocks in a sequence starting from the last block.
 
@@ -375,9 +374,10 @@ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
         List[Block]: A list of all the blocks in the sequence, in the order they
             appear.
     """
-
+    # prev_block 应该是前一个逻辑block， 通常一个seq由多个逻辑块block组成
+    # 加上校验- 避免错误的
     def recurse(block: Block, lst: List[Block]) -> None:
-        if block.prev_block is not None:
+        if block.prev_block is not None and block.prev_block != block:
             recurse(block.prev_block, lst)
         lst.append(block)
 

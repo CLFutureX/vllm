@@ -52,7 +52,7 @@ class NaiveBlockAllocator(BlockAllocator):
         self._refcounter = RefCounter(
             all_block_indices=self._free_block_indices)
         self._block_size = block_size
-
+        # 将对象转换成只读对象，避免外部修改
         self._cow_tracker = CopyOnWriteTracker(
             refcounter=self._refcounter.as_readonly())
 
@@ -158,8 +158,10 @@ class NaiveBlockAllocator(BlockAllocator):
         assert block_id is not None
         # 避免释放了并没有被分配的blockId，if block_id in _refcounter and in _free_block_indices,it could be error
         refcount = self._refcounter.decr(block_id)
-        # 引用数为0时，重新加入到free集合中，这里应该校验一下 _free_block_indices中一定不包含此blockId
+        # 引用数为0时，重新加入到free集合中，这里应该校验一下 _free_block_indices中一定不包含此blockId,
+        # 如果没有被引用，那么上一步就会报错
         if refcount == 0:
+            # 为了代码健壮性，避免计算和分配不一致，可以加上校验。
             assert block_id not in self._free_block_indices
             self._free_block_indices.appendleft(block_id)
 
@@ -174,6 +176,11 @@ class NaiveBlockAllocator(BlockAllocator):
     def free_block_id(self, block_id: BlockId) -> None:
         self._free_block_id(block_id)
 
+    # 创建一个新的序列块，与之前的块共享底层内存
+    # 所以，会对底层内存添加引用，代表有多个逻辑块共同引用了底层内存，然后当需要写时，就copy一份单独的内存去写
+    # 为什么要将前面所有的计数都加1？ 而不是仅增加前一个的引用计数呢？
+    # 因为一个序列（sequence）通常由一系列逻辑块组成，这些逻辑块之间通过preBlock进行连接，同时这些preBlock正常对应的物理块也是不一样的？所以需要遍历进行
+    # 序列之间会不会也有共享的block？ 有也没关系，释放时多次释放即可。
     def fork(self, last_block: Block) -> List[Block]:
         """Creates a new sequence of blocks that shares the same underlying
         memory as the original sequence.
@@ -193,7 +200,10 @@ class NaiveBlockAllocator(BlockAllocator):
 
             # Increment refcount for each block.
             assert block.block_id is not None
+            # block1引用了2，blcok1没有从中获取时，此时 refCount = 1, 只要有被引用过，就不会存在于free队列中了
+            assert self._refcounter.get(block.block_id) > 0, "can't fork free'd block"
             refcount = self._refcounter.incr(block.block_id)
+            # 不能对free block进行fork，因为这样的block没有人引用，可以直接使用，而不是fork
             assert refcount != 1, "can't fork free'd block"
 
             forked_block = self._block_pool.init_block(
@@ -354,7 +364,7 @@ class NaiveBlockAllocator(BlockAllocator):
         return []
 
 
-class NaiveBlock(Block):
+class NaiveBlock(Block): 
     """An implementation of the Block class that does not support prefix
     caching.
 
