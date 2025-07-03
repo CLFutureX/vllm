@@ -36,7 +36,12 @@ class RefCounter(RefCounterProtocol):
     """
 
     def __init__(self, all_block_indices: Iterable[BlockId]):
-        deduped = set(all_block_indices)
+        if not isinstance(all_block_indices,set):
+            deduped = set(all_block_indices)
+        else:
+            deduped = all_block_indices.copy()
+        # 每次都调用set，这样会创建新的对象 
+        # 初始化，引用都是为0
         self._refcounts: Dict[BlockId, RefCount] = {
             index: 0
             for index in deduped
@@ -66,7 +71,7 @@ class RefCounter(RefCounterProtocol):
     def get(self, block_id: BlockId) -> RefCount:
         assert block_id in self._refcounts
         return self._refcounts[block_id]
-
+    # 重点设计，将其转换成只读计数
     def as_readonly(self) -> "ReadOnlyRefCounter":
         return ReadOnlyRefCounter(self)
 
@@ -112,6 +117,9 @@ class CopyOnWriteTracker:
         self._copy_on_writes: List[Tuple[BlockId, BlockId]] = []
         self._refcounter = refcounter
 
+    # 通过是否被共享，来判断在写时，是否需要执行写时复制操作
+    # 校验block是否可以被操作，通过block是否被共享了来看，只有一个人独占时，代表可以直接操作
+    # 已经被多方引用时，代表被共享了，需要copyOnWrite，拷贝之后，进行操作
     def is_appendable(self, block: Block) -> bool:
         """Checks if the block is shared or not. If shared, then it cannot
         be appended and needs to be duplicated via copy-on-write
@@ -122,7 +130,7 @@ class CopyOnWriteTracker:
 
         refcount = self._refcounter.get(block_id)
         return refcount <= 1
-
+    # 记录源block与当前copyOnWrite创建的新的block
     def record_cow(self, src_block_id: Optional[BlockId],
                    trg_block_id: Optional[BlockId]) -> None:
         """Records a copy-on-write operation from source to target block id
@@ -170,12 +178,19 @@ class BlockPool:
         self._block_size = block_size
         self._create_block = create_block
         self._allocator = allocator
-        self._pool_size = pool_size
+        self._pool_limit = pool_size
         assert self._pool_size >= 0
 
         self._free_ids: Deque[int] = deque(range(self._pool_size))
         self._pool = []
-        for i in range(self._pool_size):
+        # 初始化就创建，不是一个好的操作，最好先预创建相同数目的即可。
+        self._initial_size = min(512, len(self._allocator.all_block_ids/2))
+        self.extend_pool(self._initial_size)
+        
+    def extend_pool(self, end_size): 
+        end_size = min(end_size, self._pool_limit)
+        for i in range(len(self._pool), end_size):
+            # 此时只会加上这个对象，不会执行任何方法？
             self._pool.append(
                 self._create_block(prev_block=None,
                                    token_ids=[],
@@ -187,20 +202,13 @@ class BlockPool:
     def increase_pool(self):
         """Doubles the internal pool size
         """
-        cur_pool_size = self._pool_size
-        new_pool_size = cur_pool_size * 2
-        self._pool_size = new_pool_size
+        cur_pool_limit = self._pool_limit
+        new_pool_limit = cur_pool_limit * 2
+        self._pool_limit = new_pool_limit
 
-        self._free_ids += deque(range(cur_pool_size, new_pool_size))
+        self._free_ids += deque(range(cur_pool_limit, new_pool_limit))
 
-        for i in range(cur_pool_size, new_pool_size):
-            self._pool.append(
-                self._create_block(prev_block=None,
-                                   token_ids=[],
-                                   block_size=self._block_size,
-                                   allocator=self._allocator,
-                                   block_id=None,
-                                   extra_hash=None))
+        self.extend_pool(new_pool_limit) 
 
     def init_block(self,
                    prev_block: Optional[Block],
@@ -209,12 +217,16 @@ class BlockPool:
                    physical_block_id: Optional[int],
                    extra_hash: Optional[int] = None) -> Block:
         if len(self._free_ids) == 0:
+            assert len(self._pool) == self._pool_limit
             self.increase_pool()
             assert len(self._free_ids) > 0
 
         pool_id = self._free_ids.popleft()
-
+        # 预分配，每次在获取为空时，进行预分配
         block = self._pool[pool_id]
+        if block is None: 
+            self.extend_pool(2 * len(self._pool))
+            # 重新初始化一次
         block.__init__(  # type: ignore[misc]
             prev_block=prev_block,
             token_ids=token_ids,
@@ -222,10 +234,13 @@ class BlockPool:
             allocator=block._allocator,  # type: ignore[attr-defined] 
             block_id=physical_block_id,
             extra_hash=extra_hash)
+        # 动态添加属性
         block.pool_id = pool_id  # type: ignore[attr-defined]
         return block
-
+    # free block时，仅将block id重新存储，block没有主动清理，所以选择将其放在左边，下一次直接获取，减少手动清理 block？
+    # 这里需要结合python的gc回收机制
     def free_block(self, block: Block) -> None:
+        assert block.pool_id not in self._free_ids  
         self._free_ids.appendleft(block.pool_id)  # type: ignore[attr-defined]
 
 

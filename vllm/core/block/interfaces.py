@@ -79,6 +79,7 @@ class Block(ABC):
     def last_accessed(self, last_accessed_ts: float):
         raise NotImplementedError
 
+# 使用call作为工程创建的方法，使工厂对象可以像函数一样被调用，
     class Factory(Protocol):
 
         @abstractmethod

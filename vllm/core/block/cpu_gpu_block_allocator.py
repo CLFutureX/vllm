@@ -141,6 +141,10 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         Returns:
             Block: The newly allocated mutable block.
         """
+        # 根据device选择分配器：CPU or GPU ，有必要合到一起吗？不应该分离吗？ 一个接口，多个实现即可。
+        # oo 这个类相当于是实现了 设备分配器，作为了CPU和GPU这两种设备的一层代理。
+        # 其实如果CPU，GPU逻辑相似时，可以这样，否则没必要其实，完全可以在 DeviceAwareBlockAllocator 中完成， 易或者DeviceAwareBlockAllocator被作为了接口
+        # 然后这个是实现，然后再根据device调用不同的实现
         return self._allocators[device].allocate_mutable_block(
             prev_block, extra_hash=extra_hash)
 

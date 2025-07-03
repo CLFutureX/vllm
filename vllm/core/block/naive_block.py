@@ -27,6 +27,11 @@ class NaiveBlockAllocator(BlockAllocator):
             block IDs. If not provided, block IDs will be assigned sequentially
             from 0 to num_blocks - 1.
     """
+    # 创建时分配的block是物理块的记录信息
+    # block_pool则是逻辑块池
+    # 允许block_pool 多余物理块的原因： 请求比较多时，可以先占用逻辑块暂存，当有物理块释放时，直接立即占用即可，
+    # 从而避免同时等待逻辑块和物理块的释放。 相当于一个等待排队的队列，先准备好，然后随时执行，而不是等到可以执行时，开始准备。
+    # 更核心的原因： 可能会有多个逻辑块指向物理块- 以便支持前缀缓存和更复杂的物理块共享机制
 
     def __init__(
         self,
@@ -38,11 +43,12 @@ class NaiveBlockAllocator(BlockAllocator):
     ):
         if block_ids is None:
             block_ids = range(num_blocks)
-
+        # 释放的block 块索引-非空的，所有可用block_ids
         self._free_block_indices: Deque[BlockId] = deque(block_ids)
+        # 所有块索引- 将其转换成不可变的ids集合- 确保block_ids 和 num_blocks一致，那为什么不直接传入block集合呢？ 那可以避免这种不一致的风险了。
         self._all_block_indices = frozenset(block_ids)
         assert len(self._all_block_indices) == num_blocks
-
+        # 引用计数： 
         self._refcounter = RefCounter(
             all_block_indices=self._free_block_indices)
         self._block_size = block_size
@@ -50,11 +56,12 @@ class NaiveBlockAllocator(BlockAllocator):
         self._cow_tracker = CopyOnWriteTracker(
             refcounter=self._refcounter.as_readonly())
 
+# block_pool 池？ 预分配超过当前num_blocks？ 那如何与blockId对应呢？
         if block_pool is None:
             extra_factor = 4
             # Pre-allocate "num_blocks * extra_factor" block objects.
             # The "* extra_factor" is a buffer to allow more block objects
-            # than physical blocks
+            # than physical blocks - -为什么create_block要这么快指定？
             self._block_pool = BlockPool(self._block_size, create_block, self,
                                          num_blocks * extra_factor)
         else:
@@ -79,7 +86,8 @@ class NaiveBlockAllocator(BlockAllocator):
 
         Returns:
             Block: The newly allocated immutable block.
-        """
+        """ 
+        # 为什么要asset device is None?  对于Immutable 其实底层也是mutableBlock
         assert device is None
         block = self.allocate_mutable_block(prev_block=prev_block)
         block.append_token_ids(token_ids)
@@ -124,17 +132,19 @@ class NaiveBlockAllocator(BlockAllocator):
             Block: The newly allocated mutable block.
         """
         assert device is None
+        # 分配物理blockId
         block_id = self._allocate_block_id()
         block = self._block_pool.init_block(prev_block=prev_block,
                                             token_ids=[],
                                             block_size=self._block_size,
                                             physical_block_id=block_id)
+        # 返回逻辑block
         return block
 
     def _allocate_block_id(self) -> BlockId:
         if not self._free_block_indices:
             raise BlockAllocator.NoFreeBlocksError()
-
+        # 为什么不将取操作和释放操作封装- 已经是在allocate内部了，这其实就是封装了
         block_id = self._free_block_indices.popleft()
         self._refcounter.incr(block_id)
         return block_id
@@ -146,9 +156,11 @@ class NaiveBlockAllocator(BlockAllocator):
         else:
             block_id = block
         assert block_id is not None
-
+        # 避免释放了并没有被分配的blockId，if block_id in _refcounter and in _free_block_indices,it could be error
         refcount = self._refcounter.decr(block_id)
+        # 引用数为0时，重新加入到free集合中，这里应该校验一下 _free_block_indices中一定不包含此blockId
         if refcount == 0:
+            assert block_id not in self._free_block_indices
             self._free_block_indices.appendleft(block_id)
 
     def free(self, block: Block, keep_block_object: bool = False) -> None:
@@ -239,12 +251,12 @@ class NaiveBlockAllocator(BlockAllocator):
 
         if self._cow_tracker.is_appendable(block):
             return src_block_id
-
+        # 释放当前块的引用，创建一个新的block
         self._free_block_id(block)
         trg_block_id = self._allocate_block_id()
 
         self._cow_tracker.record_cow(src_block_id, trg_block_id)
-
+        # 返回新的blockId 
         return trg_block_id
 
     def clear_copy_on_writes(self) -> List[Tuple[BlockId, BlockId]]:
@@ -380,7 +392,7 @@ class NaiveBlock(Block):
         self._cow_target = _cow_target if _cow_target is not None else self
 
         self._append_token_ids_no_cow(token_ids)
-
+    # 将token_id 添加到token集合中
     def append_token_ids(self, token_ids: List[int]) -> None:
         """Appends the given token IDs to the block and performs a 
         copy-on-write if necessary.
@@ -390,7 +402,7 @@ class NaiveBlock(Block):
                 to the block.
         """
         self._append_token_ids_no_cow(token_ids)
-
+        # 物理block不为空时，会判断是否进行copy-On-Write, 基于这个物理block是否被多个同时共享了。
         if self._block_id is not None:
             self._block_id = (self._allocator.cow_block_if_not_appendable(
                 self._cow_target))

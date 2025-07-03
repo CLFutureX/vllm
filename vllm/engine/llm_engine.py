@@ -579,7 +579,7 @@ class LLMEngine:
         block_size = self.cache_config.block_size
         seq_id = next(self.seq_counter)
         eos_token_id = self.input_preprocessor.get_eos_token_id(lora_request)
-
+        # 默认是decoder
         encoder_inputs, decoder_inputs = split_enc_dec_inputs(processed_inputs)
 
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
@@ -628,6 +628,7 @@ class LLMEngine:
     def stop_remote_worker_execution_loop(self) -> None:
         self.model_executor.stop_remote_worker_execution_loop()
 
+    # 
     def add_request(
         self,
         request_id: str,
@@ -683,7 +684,7 @@ class LLMEngine:
             >>> engine.add_request(
             >>>    str(request_id),
             >>>    example_prompt,
-            >>>    SamplingParams(temperature=0.0))
+            >>>    sampling_params)
             >>> # continue the request processing
             >>> ...
         """
@@ -714,14 +715,14 @@ class LLMEngine:
                 and not prompt.get("prompt_token_ids", None)):
             seq_len = prompt["prompt_embeds"].shape[0]
             prompt["prompt_token_ids"] = [0] * seq_len
-
+        # 预处理：将请求转换成目标的类型？
         processed_inputs = self.input_preprocessor.preprocess(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
-
+        # 添加到请求池
         self._add_processed_request(
             request_id=request_id,
             processed_inputs=processed_inputs,

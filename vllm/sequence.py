@@ -55,7 +55,7 @@ PromptLogprobs = list[Optional[dict[int, Logprob]]]
 # {token_id -> logprob} for each sequence group.
 SampleLogprobs = list[dict[int, Logprob]]
 
-
+# 通过状态解决复杂性
 class SequenceStatus(enum.IntEnum):
     """Status of a sequence."""
     WAITING = 0

@@ -167,13 +167,16 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # Allocate self-attention block tables for decoder sequences
         waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+        # 集合交集：set(seq.id) 和block_keys 集合，取交集，如果不为空，则报错
         assert not (set(seq.seq_id for seq in waiting_seqs)
                     & self.block_tables.keys()), "block table already exists"
 
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
         seq = waiting_seqs[0]
+        # 分配seq的内存-
         block_table: BlockTable = self._allocate_sequence(seq)
+        # 完成 seq_id <-> blockTable
         self.block_tables[seq.seq_id] = block_table
 
         # Track seq

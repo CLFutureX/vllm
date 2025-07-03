@@ -52,6 +52,7 @@ class BlockTable:
         self._allocator = block_allocator
         if _blocks is None:
             _blocks = []
+        # 仅存放已经分配的block， block与seq的关系由上层处理
         self._blocks: BlockList = BlockList(_blocks)
 
         self._max_block_sliding_window = max_block_sliding_window
@@ -100,11 +101,14 @@ class BlockTable:
         """
         assert not self._is_allocated
         assert token_ids
+        # 调用分配器，为tokenId分配内存，这里分配的是 逻辑物理块，内部已经将token_ids 写入到block中了
         blocks = self._allocate_blocks_for_token_ids(prev_block=None,
                                                      token_ids=token_ids,
                                                      device=device,
                                                      extra_hash=extra_hash)
+        # block块更新
         self.update(blocks)
+        # 这里应该是 += bug
         self._num_full_slots = len(token_ids)
 
     def update(self, blocks: List[Block]) -> None:
@@ -286,16 +290,19 @@ class BlockTable:
             device: Device,
             extra_hash: Optional[int] = None) -> List[Block]:
         blocks: List[Block] = []
-
+        # 存放完整占用block的 token Id
         block_token_ids = []
-        tail_token_ids = []
+        # 存放未完整占用block的token Id
+        tail_token_ids = None
+        # 默认的block_size = 16?
         for cur_token_ids in chunk_list(token_ids, self._block_size):
             if len(cur_token_ids) == self._block_size:
                 block_token_ids.append(cur_token_ids)
             else:
-                tail_token_ids.append(cur_token_ids)
+                tail_token_id = cur_token_ids
 
         if block_token_ids:
+            # 对于可以占满的block，分配不可继续写的block
             blocks.extend(
                 self._allocator.allocate_immutable_blocks(
                     prev_block,
@@ -304,13 +311,11 @@ class BlockTable:
                     extra_hash=extra_hash))
             prev_block = blocks[-1]
 
-        if tail_token_ids:
-            assert len(tail_token_ids) == 1
-            cur_token_ids = tail_token_ids[0]
-
+        if tail_token_ids:   
+            # 对于非占满的block，分配可写的block
             block = self._allocator.allocate_mutable_block(
                 prev_block=prev_block, device=device, extra_hash=extra_hash)
-            block.append_token_ids(cur_token_ids)
+            block.append_token_ids(tail_token_ids)
 
             blocks.append(block)
 
