@@ -183,6 +183,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._last_access_blocks_tracker.add_seq(seq.seq_id)
 
         # Assign the block table for each sequence.
+        # 其余的都会从这个进行fork
         for seq in waiting_seqs[1:]:
             self.block_tables[seq.seq_id] = block_table.fork()
 

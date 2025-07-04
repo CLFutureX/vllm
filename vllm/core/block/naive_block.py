@@ -89,8 +89,13 @@ class NaiveBlockAllocator(BlockAllocator):
         """ 
         # 为什么要asset device is None?  对于Immutable 其实底层也是mutableBlock
         assert device is None
-        block = self.allocate_mutable_block(prev_block=prev_block)
-        block.append_token_ids(token_ids)
+        
+        block_id = self._allocate_block_id()
+        block = self._block_pool.init_block(prev_block=prev_block, 
+                                            token_ids= token_ids,
+                                            block_size=self._block_size,
+                                            physical_block_id=block_id)
+    
         return block
 
     def allocate_immutable_blocks(
@@ -101,6 +106,9 @@ class NaiveBlockAllocator(BlockAllocator):
             device: Optional[Device] = None) -> List[Block]:
         assert device is None
         num_blocks = len(block_token_ids)
+        # 批量分配时，提前预校验是否足够，不够直接返回，否则会导致内部数据错误
+        if self.get_num_free_blocks() < num_blocks:
+            raise BlockAllocator.NoFreeBlocksError()
 
         block_ids = []
         for i in range(num_blocks):
@@ -118,7 +126,7 @@ class NaiveBlockAllocator(BlockAllocator):
         return blocks
 
     def allocate_mutable_block(self,
-                               prev_block: Optional[Block],
+                               prev_block: Optional[Block], 
                                extra_hash: Optional[int] = None,
                                device: Optional[Device] = None) -> Block:
         """Allocates a new mutable block, linked to the previous block.
@@ -134,8 +142,7 @@ class NaiveBlockAllocator(BlockAllocator):
         assert device is None
         # 分配物理blockId
         block_id = self._allocate_block_id()
-        block = self._block_pool.init_block(prev_block=prev_block,
-                                            token_ids=[],
+        block = self._block_pool.init_block(prev_block=prev_block, 
                                             block_size=self._block_size,
                                             physical_block_id=block_id)
         # 返回逻辑block
@@ -201,6 +208,7 @@ class NaiveBlockAllocator(BlockAllocator):
             # Increment refcount for each block.
             assert block.block_id is not None
             # block1引用了2，blcok1没有从中获取时，此时 refCount = 1, 只要有被引用过，就不会存在于free队列中了
+            # 有可能后面其他适用了之前的block_id，之前的block会被分配给其他？然后block的引用不为空，于是会覆盖？
             assert self._refcounter.get(block.block_id) > 0, "can't fork free'd block"
             refcount = self._refcounter.incr(block.block_id)
             # 不能对free block进行fork，因为这样的block没有人引用，可以直接使用，而不是fork
@@ -258,9 +266,12 @@ class NaiveBlockAllocator(BlockAllocator):
         """
         src_block_id = block.block_id
         assert src_block_id is not None
-
+        # 校验目标物理block是否独占，如果是共享的代表不能被追加，需要cow
         if self._cow_tracker.is_appendable(block):
             return src_block_id
+        # 释放之前，是不是也应该先判断是否足够，够的时候，才进行，否则这个block的引用也被释放了
+        if self.get_num_free_blocks() < 1:
+            raise BlockAllocator.NoFreeBlocksError()
         # 释放当前块的引用，创建一个新的block
         self._free_block_id(block)
         trg_block_id = self._allocate_block_id()
@@ -393,16 +404,18 @@ class NaiveBlock(Block):
                  allocator: BlockAllocator,
                  block_id: Optional[int] = None,
                  _cow_target: Optional[Block] = None,
-                 extra_hash: Optional[int] = None):
+                 extra_hash: Optional[int] = None,
+                 read_only: bool = False):
         self._token_ids: List[int] = []
         self._block_size = block_size
         self._prev_block = prev_block
         self._block_id = block_id
         self._allocator = allocator
         self._cow_target = _cow_target if _cow_target is not None else self
+        self._read_only = read_only
 
         self._append_token_ids_no_cow(token_ids)
-    # 将token_id 添加到token集合中
+    # 将token_id 添加到token集合中, 会判断当前被添加的block是否是共享block，如果是，则需要进行cow
     def append_token_ids(self, token_ids: List[int]) -> None:
         """Appends the given token IDs to the block and performs a 
         copy-on-write if necessary.
@@ -411,6 +424,8 @@ class NaiveBlock(Block):
             token_ids (Optional[List[int]]): The token IDs to be appended 
                 to the block.
         """
+        if self._read_only:
+            raise ValueError("The block only read") # 写入一个错误类抛出
         self._append_token_ids_no_cow(token_ids)
         # 物理block不为空时，会判断是否进行copy-On-Write, 基于这个物理block是否被多个同时共享了。
         if self._block_id is not None:
@@ -423,6 +438,8 @@ class NaiveBlock(Block):
         Args:
             token_ids (List[int]): The token IDs to be appended to the block.
         """
+        if token_ids is None:
+            return
         if len(token_ids) == 0:
             return
 

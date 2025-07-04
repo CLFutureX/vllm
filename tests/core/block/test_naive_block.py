@@ -43,6 +43,7 @@ class TestNaiveBlockAllocator:
             token_ids=list(range(block_size)))
 
         [allocate_block() for _ in range(num_blocks)]
+        # 验证执行完成之后，是否会产生这个异常
         with pytest.raises(BlockAllocator.NoFreeBlocksError):
             allocate_block()
 

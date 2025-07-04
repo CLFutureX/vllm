@@ -177,23 +177,23 @@ class BlockPool:
                  allocator: BlockAllocator, pool_size: int):
         self._block_size = block_size
         self._create_block = create_block
-        self._allocator = allocator
+        self._allocator = allocator 
         self._pool_limit = pool_size
-        assert self._pool_size >= 0
+        assert self._pool_limit >= 0
 
-        self._free_ids: Deque[int] = deque(range(self._pool_size))
+        self._free_ids: Deque[int] = deque(range(self._pool_limit))
         self._pool = []
         # 初始化就创建，不是一个好的操作，最好先预创建相同数目的即可。
-        self._initial_size = min(512, len(self._allocator.all_block_ids/2))
+        self._initial_size = min(512, len(self._allocator.all_block_ids)/2)
         self.extend_pool(self._initial_size)
         
     def extend_pool(self, end_size): 
         end_size = min(end_size, self._pool_limit)
-        for i in range(len(self._pool), end_size):
+        for i in range(len(self._pool), int(end_size)):
             # 此时只会加上这个对象，不会执行任何方法？
             self._pool.append(
                 self._create_block(prev_block=None,
-                                   token_ids=[],
+                                   token_ids=List[int],
                                    block_size=self._block_size,
                                    allocator=self._allocator,
                                    block_id=None,
@@ -265,7 +265,7 @@ class BlockList:
                          new_block_id: Optional[BlockId]) -> None:
         assert new_block_id is not None
         self._block_ids[block_index] = new_block_id
-
+    #设计的真有点鸡肋-更新时，维护了索引
     def update(self, blocks: List[Block]):
         self._blocks = blocks
 
@@ -375,7 +375,7 @@ def get_all_blocks_recursively(last_block: Block) -> List[Block]:
             appear.
     """
     # prev_block 应该是前一个逻辑block， 通常一个seq由多个逻辑块block组成
-    # 加上校验- 避免错误的
+    # 加上校验- 避免错误的-空块的前一个是None？
     def recurse(block: Block, lst: List[Block]) -> None:
         if block.prev_block is not None and block.prev_block != block:
             recurse(block.prev_block, lst)

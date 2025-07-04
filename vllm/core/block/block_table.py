@@ -81,7 +81,7 @@ class BlockTable:
                 sequence of token IDs along with any required look-ahead slots.
         """
         return cdiv(len(token_ids) + num_lookahead_slots, block_size)
-
+    # 为什么分配时，会重新分配block？
     def allocate(self,
                  token_ids: List[int],
                  device: Device = Device.GPU,
@@ -99,23 +99,27 @@ class BlockTable:
                 factors, such as adapters, that influence the block hash
                 in the prefixcaching block.
         """
+        # 只有在未进行分配时，这里才允许进行分配，也就是在创建时，传人blocks时
         assert not self._is_allocated
         assert token_ids
+        # allocate 也应该进行限制，如果设置了最大的滑动时间窗口
         # 调用分配器，为tokenId分配内存，这里分配的是 逻辑物理块，内部已经将token_ids 写入到block中了
         blocks = self._allocate_blocks_for_token_ids(prev_block=None,
                                                      token_ids=token_ids,
                                                      device=device,
                                                      extra_hash=extra_hash)
-        # block块更新
-        self.update(blocks)
-        # 这里应该是 += bug
-        self._num_full_slots = len(token_ids)
+        # block块更新 应该将blocks和tokenIds 封装在一块，避免更新了blocks，却没有更新token数
+        self.update(blocks, len(token_ids)) 
 
-    def update(self, blocks: List[Block]) -> None:
+    def update(self, blocks: List[Block], num_token_ids: int = None) -> None:
         """Resets the table to the newly provided blocks 
         (with their corresponding block ids)
         """
         self._blocks.update(blocks)
+        if num_token_ids is None:
+            self._num_full_slots = self._get_num_token_ids()
+        else:
+            self._num_full_slots = num_token_ids
 
     def append_token_ids(self,
                          token_ids: List[int],
@@ -154,27 +158,34 @@ class BlockTable:
         if self._max_block_sliding_window is not None:
             null_block = self._allocator.allocate_or_get_null_block()
             assert num_computed_slots is not None
+            # 计算当前会占用的block数量-  最大占用窗口 = 需要截断释放的block块32/4 = 8 33/4 = 8 -4 释放4个 此时占用了9个窗口，最大4个，但此时也只会释放4个，会预多占用一个。
             end_block_idx = (num_computed_slots //
                              self._block_size) - self._max_block_sliding_window
             for idx in range(0, end_block_idx):
-                b = self._blocks[idx]
+                b = self._blocks[idx] 
                 if b is not null_block:
+                    # 将超过的block进行释放- 如果此时已经释放的block为free了，那么后面fork在窗口内的block时，
+                    # 会一直向前引用，此时就会由于fork了free的block而报错
                     self._allocator.free(b)
+                    # 标记为可以复用的block
                     self._blocks[idx] = null_block
-
+                    # block[idx+1]的block的pre_block？
+            # 释放之后，将pre置空
+            self._blocks[end_block_idx].prev_block = None
         # Ensure there are enough empty slots for the new tokens plus
         # lookahead slots
         self.ensure_num_empty_slots(num_empty_slots=len(token_ids) +
                                     num_lookahead_slots,
                                     extra_hash=extra_hash)
 
-        # Update the blocks with the new tokens
+        # Update the blocks with the new tokens，获取当前可以写入的block_idx
+        # num_full_slots就一直作为下一个block写入的idx，那这样来看 blocks岂不是会无限扩展？
         first_block_idx = self._num_full_slots // self._block_size
         token_blocks = self._chunk_token_blocks_for_append(token_ids)
 
         for i, token_block in enumerate(token_blocks):
             self._blocks.append_token_ids(first_block_idx + i, token_block)
-
+        # 继续累加_num_full_slots,代表写入了的数据，那其实也不应该封装在一起了？
         self._num_full_slots += len(token_ids)
 
     def ensure_num_empty_slots(self,
@@ -198,13 +209,14 @@ class BlockTable:
         # appending tokens to GPU blocks.
         device = Device.GPU
         assert self._is_allocated
-
+        # 可用slots= blocks * blocks.size - num_full_slots, 前面释放了block之后，是否应该将num_full_slots 也更新呢？
+        # 因为其实此时有可用的了 - 不够的话，就会进行分配blocks
         if self._num_empty_slots >= num_empty_slots:
             return
 
         slots_to_allocate = num_empty_slots - self._num_empty_slots
         blocks_to_allocate = cdiv(slots_to_allocate, self._block_size)
-
+        # 重新分配可写block-将其累加到_blocks中
         for _ in range(blocks_to_allocate):
             assert len(self._blocks) > 0
             self._blocks.append(
@@ -244,6 +256,7 @@ class BlockTable:
         occupied by each block. After freeing all the blocks, the `_blocks` list
         is set to `None`.
         """
+        # 释放时，会过滤为null的直接进行释放， 为什么不维护下标，
         for block in self.blocks:
             self._allocator.free(block)
         self._blocks.reset()
@@ -293,13 +306,14 @@ class BlockTable:
         # 存放完整占用block的 token Id
         block_token_ids = []
         # 存放未完整占用block的token Id
-        tail_token_ids = None
+        
         # 默认的block_size = 16?
-        for cur_token_ids in chunk_list(token_ids, self._block_size):
-            if len(cur_token_ids) == self._block_size:
-                block_token_ids.append(cur_token_ids)
-            else:
-                tail_token_id = cur_token_ids
+        endIndex = 0
+        for i in range(0, len(token_ids) / self._block_size):
+            endIndex = i * self._block_size
+            block_token_ids.append(token_ids[endIndex:endIndex + self._block_size])
+            
+        tail_token_ids = token_ids[endIndex:]
 
         if block_token_ids:
             # 对于可以占满的block，分配不可继续写的block
@@ -312,7 +326,7 @@ class BlockTable:
             prev_block = blocks[-1]
 
         if tail_token_ids:   
-            # 对于非占满的block，分配可写的block
+            # 对于非占满的block，分配可写的block， 可写的block时
             block = self._allocator.allocate_mutable_block(
                 prev_block=prev_block, device=device, extra_hash=extra_hash)
             block.append_token_ids(tail_token_ids)

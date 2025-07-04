@@ -112,7 +112,7 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
 
         self._swap_mapping: Dict[int, int] = {}
         self._null_block: Optional[Block] = None
-
+        # 记录blockId 和 Allocator的对应关系，方便进行fork 为什么不应该是记录在block上？ 
         self._block_ids_to_allocator: Dict[int, BlockAllocator] = {}
         for _, allocator in self._allocators.items():
             for block_id in allocator.all_block_ids:
