@@ -107,7 +107,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         extra_factor = 4
         self._block_pool = BlockPool(self._block_size, self._create_block,
                                      self, num_blocks * extra_factor)
-
+        # 为那些没有相同前缀的blocks专门的分配器？
         # An allocator for blocks that do not have prefix hashes.
         self._hashless_allocator = NaiveBlockAllocator(
             create_block=self._create_block,  # type: ignore
@@ -120,6 +120,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # Evitor used to maintain how we want to handle those computed blocks
         # if we find memory pressure is high.
         self.eviction_policy = eviction_policy
+        # 缓存驱除策略，当前仅支持LRU
         self.evictor: Evictor = make_evictor(self.eviction_policy)
 
         # We share the refcounter between allocators. This allows us to promote
@@ -180,7 +181,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                                             physical_block_id=None,
                                             extra_hash=extra_hash)
         assert block.content_hash is not None
-
+        # 尝试从缓存中获取-  应该要先批量校验，避免部分成功，部分失败。
         cached_block_id = self._cached_blocks.get(block.content_hash, None)
         if cached_block_id is not None:
             self.metric_data.query(hit=True)
@@ -194,6 +195,43 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         block = self.allocate_mutable_block(prev_block, extra_hash=extra_hash)
         block.append_token_ids(token_ids)
         return block
+    
+    def check_allocate_enough(self, 
+            block_token_ids: List[List[int]],
+            extra_hash: Optional[int] = None) -> bool:
+        need_allocate_num = len(block_token_ids)
+        
+        free_blocks_num = self._hashless_allocator.get_num_free_blocks()
+        evict_blocks_num = self.evictor.num_blocks()
+        need_blocks_num = need_allocate_num - free_blocks_num - evict_blocks_num
+
+        i = 0  
+        # 从缓存中获取，重新分配，驱逐
+        while i < len(block_token_ids) and need_blocks_num > 0: 
+            token_ids = block_token_ids[i]
+            
+            block = self._block_pool.init_block(prev_block=None,
+                                            token_ids=token_ids,
+                                            block_size=self._block_size,
+                                            physical_block_id=None,
+                                            extra_hash=extra_hash)
+            
+            assert block.content_hash is not None
+            cached_block_id = self._cached_blocks.get(block.content_hash, None)
+            if cached_block_id is not None:
+                need_blocks_num -= 1
+            self._block_pool.free_block(block)
+            i += 1
+
+        if need_blocks_num > 0: 
+            raise BlockAllocator.NoFreeBlocksError() 
+
+
+
+
+
+
+
 
     def allocate_immutable_blocks(
             self,
@@ -202,11 +240,16 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             extra_hash: Optional[int] = None,
             device: Optional[Device] = None) -> List[Block]:
         blocks = []
+        self.check_allocate_enough(block_token_ids, extra_hash)
+        
+        # 优化点： 在分配器的可用block_id 不够时，进行完整的检查。
         for token_ids in block_token_ids:
+             
             prev_block = self.allocate_immutable_block(prev_block=prev_block,
                                                        token_ids=token_ids,
                                                        device=device,
                                                        extra_hash=extra_hash)
+            
             blocks.append(prev_block)
         return blocks
 
@@ -246,6 +289,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert block_id is not None
 
         refcount = self._refcounter.incr(block_id)
+        # =0时应该会，加入到evictor中，等待被淘汰，>0 时，代表有了新的引用，于是进行移除
         if refcount == 1:
             # In case a cached block was evicted, restore its tracking
             if block_id in self.evictor:
@@ -269,7 +313,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         # No longer used
         assert block.content_hash in self._cached_blocks
-
+        # 当引用为零时，才将其添加到待驱逐集合中
         # Add the cached block to the evictor
         # (This keeps the cached block around so it can be reused)
         self.evictor.add(block_id, block.content_hash, block.num_tokens_total,
@@ -294,6 +338,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # itself (will be handled by the caller)
         self._hashless_allocator.free(block, keep_block_object=True)
 
+    # 优先尝试从分配器中分配，如果分配不成功，则尝试进行驱逐
     def _allocate_block_id(self) -> BlockId:
         """First tries to allocate a block id from the hashless allocator,
         and if there are no blocks, then tries to evict an unused cached block.
@@ -308,7 +353,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         # No block available in hashless allocator, nor in unused cache blocks.
         raise BlockAllocator.NoFreeBlocksError()
-
+     # 仅需要获取block_id
     def _maybe_allocate_hashless_block_id(self) -> Optional[BlockId]:
         try:
             # Allocate mutable block and extract its block_id
@@ -319,6 +364,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
             self._track_block_id(block_id, computed=False)
             return block_id
+        # 看这里，还是会有异常处理的，
         except BlockAllocator.NoFreeBlocksError:
             return None
 
@@ -337,7 +383,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         _block_id = self._cached_blocks[content_hash_to_evict]
         assert self._refcounter.get(_block_id) == 0
         assert _block_id == block_id
-
+        # 从缓存中取出，然后增加物理block的引用
         self._cached_blocks.pop(content_hash_to_evict)
 
         self._refcounter.incr(block_id)
@@ -483,7 +529,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
     def is_block_cached(self, block: Block) -> bool:
         assert block.content_hash is not None
         return block.content_hash in self._cached_blocks
-
+    # 当block被写满之后，就会被升级成不可写的block， 代表着这个block将可以被后面的block直接引用
+    # 也就是被直接fork
     def promote_to_immutable_block(self, block: Block) -> BlockId:
         """Once a mutable block is full, it can be promoted to an immutable
         block. This means that its content can be referenced by future blocks
@@ -504,8 +551,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert block.content_hash is not None
         assert block.block_id is not None
         assert self._refcounter.get(block.block_id) > 0
-
-        if block.content_hash not in self._cached_blocks:
+        # 通过hash值，作为缓存标记，不存在则加入
+        if block.content_hash not in self._cached_blocks: 
             # No cached content hash => Set this block as cached.
             # Note that this block cannot be marked as computed yet
             # because other sequences in the same batch cannot reuse
@@ -514,15 +561,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             # Mark this block as touched so that it can be marked as
             # computed after the entire batch of sequences are scheduled.
             self._touched_blocks.add(block.block_id)
-            return block.block_id
-
+            return block.block_id 
+        # block已存在缓存中，则可以释放当前block的引用了，避免多余占用
         # Reuse the cached content hash
         self._decr_refcount_hashless_block(block)
+        # 逻辑块block的block_id指向物理块id。 这个操作和fork又不一样，fork会增加每个引用，而这个是
+        # 实现将多个逻辑block的block_id 指向同一个物理block 
         block.block_id = self._cached_blocks[block.content_hash]
 
         # Increment refcount of the cached block and (possibly) restore
         # it from the evictor.
         # Note that in this case, the block is marked as computed
+        # 增加物理块的引用
         self._incr_refcount_cached_block(block)
 
         return block.block_id
@@ -796,13 +846,17 @@ class PrefixCachingBlock(Block):
 
         self._update_num_tokens_total()
 
-    def _update_num_tokens_total(self):
+    def _update_num_tokens_total(self, add_number: int = None):
         """Incrementally computes the number of tokens that there is
         till the current block (included)
         """
+        if add_number is not None:
+            self._cached_num_tokens_total += add_number
+            return self._cached_num_tokens_total
+        
         res = 0
 
-        # Add all previous blocks
+        # Add all previous blocks- 累加
         if self._prev_block is not None:
             res += self._prev_block.num_tokens_total
 
@@ -846,7 +900,8 @@ class PrefixCachingBlock(Block):
 
         # Naive block handles CoW.
         self._block.append_token_ids(token_ids)
-        self._update_num_tokens_total()
+        # 每次都重新计算，其实就比较鸡肋了，
+        self._update_num_tokens_total(len(token_ids))
 
         # If the content hash is present, then the block can be made immutable.
         # Register ourselves with the allocator, potentially replacing the
