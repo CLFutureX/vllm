@@ -250,13 +250,13 @@ class KVCacheManager:
         num_tokens_need_slot = min(
             num_computed_tokens + num_new_tokens + num_lookahead_tokens,
             self.max_model_len)
-
+        # 计算需要分配的block
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
         )
-
+        # 必须要求有足够的block可以被分配，否则不能被调度计算。 依旧存放在waiting队列中
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None

@@ -623,6 +623,7 @@ class SyncMPClient(MPClient):
                 out_socket.close(linger=0)
 
         # Process outputs from engine in separate thread.
+        # 构建守护线程，负责接收shutdown信号通知
         self.output_queue_thread = Thread(target=process_outputs_socket,
                                           name="EngineCoreOutputQueueThread",
                                           daemon=True)
@@ -653,8 +654,9 @@ class SyncMPClient(MPClient):
             # No auxiliary buffers => no tensor backing buffers in request.
             self.input_socket.send_multipart(msg, copy=False)
             return
-
+        # 发送请求，
         tracker = self.input_socket.send_multipart(msg, copy=False, track=True)
+        # 添加到等待列表
         self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:

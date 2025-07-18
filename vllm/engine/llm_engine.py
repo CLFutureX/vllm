@@ -237,7 +237,7 @@ class LLMEngine:
 
         self.log_stats = log_stats
         self.use_cached_outputs = use_cached_outputs
-
+        # 初始化分词器
         if not self.model_config.skip_tokenizer_init:
             self.tokenizer = self._init_tokenizer()
             self.detokenizer = Detokenizer(self.tokenizer)
@@ -338,6 +338,7 @@ class LLMEngine:
                 self.vllm_config.scheduler_config.scheduler_cls)
         else:
             Scheduler = self.vllm_config.scheduler_config.scheduler_cls
+        # 0907 3 初始化调度器，根据配置的并行度创建多个调度器
         self.scheduler = [
             Scheduler(
                 self.scheduler_config, self.cache_config, self.lora_config,
@@ -616,6 +617,7 @@ class LLMEngine:
                 "Either SamplingParams or PoolingParams must be provided.")
 
         # Add the sequence group to the scheduler with least unfinished seqs.
+        # 选择 最少未完成请求的 调度器，将其添加
         costs = [
             scheduler.get_num_unfinished_seq_groups()
             for scheduler in self.scheduler
@@ -715,7 +717,7 @@ class LLMEngine:
                 and not prompt.get("prompt_token_ids", None)):
             seq_len = prompt["prompt_embeds"].shape[0]
             prompt["prompt_token_ids"] = [0] * seq_len
-        # 预处理：将请求转换成目标的类型？
+        # 预处理： 将prompt转换成 词id
         processed_inputs = self.input_preprocessor.preprocess(
             prompt,
             tokenization_kwargs=tokenization_kwargs,
@@ -1354,6 +1356,7 @@ class LLMEngine:
                     virtual_engine]
 
             try:
+                # 调用大模型 生成
                 outputs = self.model_executor.execute_model(
                     execute_model_req=execute_model_req)
                 self._skip_scheduling_next_step = False

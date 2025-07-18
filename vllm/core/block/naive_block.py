@@ -338,11 +338,13 @@ class NaiveBlockAllocator(BlockAllocator):
             if block.is_full:
                 old_block_set.add(block)
         return len(old_block_set)
-
+# 仅仅为了获取物理blockId， 是呀，这样对于GPU——allocator而言就又有新的物理block可以使用了。
+# 那物理blockId对应的物理块中存放的kvcache呢？ 其实还会存在，但这其实属于了无效数据，下一次使用时，会直接被覆盖。
+# 所以换出之后，其实对应的缓存也会清理，这也很正常，反正又不会影响最终真实的数据，影响的仅仅是缓存而已。
     def swap_out(self, blocks: List[Block]) -> None:
         for block in blocks:
             self._free_block_id(block)
-
+     
     def swap_in(self, blocks: List[Block]) -> None:
         for block in blocks:
             # Here we allocate either immutable or mutable block and then

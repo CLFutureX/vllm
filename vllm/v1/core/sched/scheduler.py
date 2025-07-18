@@ -196,22 +196,25 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
-
+        # 基于资源进行决策 - 仅最大可能利用资源
         # First, schedule the RUNNING requests.
+        # 1 首先调度 运行中的 请求
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
+            # 从左到右遍历running队列的请求
             request = self.running[req_index]
-
+            # 计算每个请求剩余需要的token空间
             num_new_tokens = (request.num_tokens_with_spec -
                               request.num_computed_tokens)
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
-                    self.scheduler_config.long_prefill_token_threshold)
+                    self.scheduler_config.long_prefill_token_threshold) 
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+            # 不能超过模型的长度限制
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len - request.num_computed_tokens)
@@ -238,17 +241,18 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
-
+            # 计算推测解码的token数： 减去原始的token数就等于 推测解码的token数了。
             num_draft_tokens = max(
                 num_new_tokens + request.num_computed_tokens -
                 request.num_tokens, 0)
-
+            # 分配资源- 在调度时才进行分配资源是正确的
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
                     num_draft_tokens=num_draft_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens)
+                # 分配blocks失败时，根据抢占策略进行抢占
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -256,11 +260,16 @@ class Scheduler(SchedulerInterface):
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
+                        ) 
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = self.running[-1]
 
+                    if preempted_req == request:
+                        can_schedule = False
+                        break
+                    self.running.remove(preempted_req)
+                    scheduled_running_reqs.remove(preempted_req)
+                    # 筛选之后，进行释放 - 会不会存在，释放之后，还不够的情况
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
@@ -271,6 +280,9 @@ class Scheduler(SchedulerInterface):
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
+                        # 如果当前的请求已经是优先级最低了，那么就中断抢占， - 反之如果
+                        # 将自己淘汰了的话，此时可能才会有空间给其他人调度。
+                        # 这里是不是应该提前判断，如果是自己的话，则不进行抢占，显然会更好。
                         # No more request to preempt.
                         can_schedule = False
                         break
@@ -278,11 +290,13 @@ class Scheduler(SchedulerInterface):
                     # The request can be scheduled.
                     can_schedule = True
                     break
+            # 退出当前for循环 
             if not can_schedule:
                 break
             assert new_blocks is not None
 
-            # Schedule the request.
+            # Schedule the request. - 后面会被抢占
+            # 这个里面的可能会被抢占。
             scheduled_running_reqs.append(request)
             if request.use_structured_output:
                 # PERF: in case of chunked prefill,
@@ -302,7 +316,8 @@ class Scheduler(SchedulerInterface):
                                              request.num_computed_tokens -
                                              request.num_tokens)
                 if num_scheduled_spec_tokens > 0:
-                    # Trim spec_token_ids list to num_scheduled_spec_tokens.
+                    # Trim spec_token_ids list to num_scheduled_spec_tokens. 删除指定范围的数据
+                    # 仅截取当前需要预测生成的token数
                     del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids)
@@ -329,6 +344,7 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        # 调度等待中的请求
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -374,19 +390,20 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
 
                 # Get already-cached tokens.
+                # 获取本地已缓存计算过的token--- 因为waiting队列中的请求，可能来自running
                 if request.num_computed_tokens == 0:
-                    # Get locally-cached tokens.
+                    # Get locally-cached tokens. 获取本地缓存的tokens
                     new_computed_blocks, num_new_local_computed_tokens = \
                         self.kv_cache_manager.get_computed_blocks(
                             request)
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    if self.connector is not None: # 获取外部缓存的token，如果分布式场景下。
                         num_external_computed_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens))
 
-                    # Total computed tokens (local + external).
+                    # Total computed tokens (local + external). 计算出所有已经计算的token
                     num_computed_tokens = (num_new_local_computed_tokens +
                                            num_external_computed_tokens)
                 # KVTransfer: WAITING reqs have num_computed_tokens > 0
@@ -409,6 +426,7 @@ class Scheduler(SchedulerInterface):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
+                    # 计算需要调度的token
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     if (0 < self.scheduler_config.long_prefill_token_threshold
                             < num_new_tokens):
@@ -422,7 +440,7 @@ class Scheduler(SchedulerInterface):
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue
-
+                    # 获取真正需要被调度的token数
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
@@ -436,7 +454,7 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
-
+                # 分配kv，缓存块
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens + num_external_computed_tokens,
@@ -488,8 +506,10 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                # 记录请求-block的对应关系 
                 req_to_new_block_ids[request.request_id] = (
                     self.kv_cache_manager.get_block_ids(request.request_id))
+                # 当前req需要调度的token数
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -743,6 +763,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+            # 获取对应req生成的tokenids
             generated_token_ids = sampled_token_ids[
                 req_index] if sampled_token_ids else []
 
@@ -755,6 +776,7 @@ class Scheduler(SchedulerInterface):
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens, where is given by:
                 # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
+                # 计算应该生成的token数 - 已经生成的= 还需要生成的
                 num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
                                        len(generated_token_ids))
                 request.num_computed_tokens -= num_tokens_rejected
@@ -790,8 +812,10 @@ class Scheduler(SchedulerInterface):
 
                 # Check for stop and update request state.
                 # This must be called before we make the EngineCoreOutput.
+                # 是否需要被终止：超过了最大长度- 模型最大支持长度，或者请求的token已经达到允许的最大参数
                 stopped = check_stop(request, self.max_model_len)
                 if stopped:
+                    # 达到之后，释放请求
                     kv_transfer_params = self._free_request(request)
                     del new_token_ids[num_new:]  # Trim new tokens if needed.
                     break
@@ -896,7 +920,9 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        # 请求加入到等待列表
         self.waiting.add_request(request)
+        # 记录待处理的请求
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)

@@ -78,6 +78,7 @@ class EngineCore:
                 executor_fail_callback)
 
         # Setup KV Caches and update CacheConfig after profiling.
+        # 基于vllm 计算gpu，cpu blocks
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = \
             self._initialize_kv_caches(vllm_config)
 
@@ -88,7 +89,7 @@ class EngineCore:
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
-        # Setup scheduler.
+        # Setup scheduler. - 初始化 调度器， 那调度器下层应该还是走以前的逻辑？
         if isinstance(vllm_config.scheduler_config.scheduler_cls, str):
             Scheduler = resolve_obj_by_qualname(
                 vllm_config.scheduler_config.scheduler_cls)
@@ -195,7 +196,7 @@ class EngineCore:
                 not self.scheduler.get_kv_connector()):
             logger.warning("Got kv_transfer_params, but no KVConnector found. "
                            "Disabling KVTransfer for this request.")
-
+        # 将请求加入到调度器中
         self.scheduler.add_request(req)
 
     def abort_requests(self, request_ids: list[str]):
@@ -262,6 +263,7 @@ class EngineCore:
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
         if not self.batch_queue.full():
+            # batch_queue 非满时，从调度器中获取待调度的请求
             scheduler_output = self.scheduler.schedule()
             if scheduler_output.total_num_scheduled_tokens > 0:
                 future = self.model_executor.execute_model(scheduler_output)
@@ -279,9 +281,10 @@ class EngineCore:
         # so we need more work.
         if not scheduled_batch and not self.batch_queue.empty():
             future, scheduler_output = self.batch_queue.get_nowait()
-            # Blocking until the first result is available.
+            # Blocking until the first result is available. 阻塞等待执行结果，应该加上阻塞超时时间，会更好
             model_output = future.result()
             self.batch_queue.task_done()
+            # 执行完成之后，更新
             engine_core_outputs = (self.scheduler.update_from_output(
                 scheduler_output, model_output))
 
@@ -494,6 +497,7 @@ class EngineCoreProc(EngineCore):
                 raise SystemExit()
 
         # Either SIGTERM or SIGINT will terminate the engine_core
+        # 监听信号
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
@@ -553,6 +557,7 @@ class EngineCoreProc(EngineCore):
             logger.debug("EngineCore loop active.")
 
         # Handle any more client requests.
+        # 从队列中获取数据
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
@@ -620,7 +625,7 @@ class EngineCoreProc(EngineCore):
         if self.output_thread.is_alive():
             logger.fatal("vLLM shutdown signal from EngineCore failed "
                          "to send. Please report this issue.")
-
+    # EngineCore 处理接收到的数据
     def process_input_sockets(self, input_addresses: list[str],
                               coord_input_address: Optional[str],
                               identity: bytes):
@@ -678,6 +683,7 @@ class EngineCoreProc(EngineCore):
                     request = decoder.decode(data_frames)
 
                     # Push to input queue for core busy loop.
+                    # 将请求放入到队列
                     self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(self, output_paths: list[str],

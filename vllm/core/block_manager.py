@@ -91,7 +91,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.enable_caching = enable_caching
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
-
+        #0907 5 block_manager-> block_allocator -> enable_caching [prefix_caching, naive]
         self.block_allocator = CpuGpuBlockAllocator.create(
             allocator_type="prefix_caching" if enable_caching else "naive",
             num_gpu_blocks=num_gpu_blocks,

@@ -128,6 +128,7 @@ class KVCacheBlock:
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
     # Reference count.
+    # 将引用计数下沉维护到缓存本身
     ref_cnt: int = 0
     # The hash of the block composed of (block hash, tuple of token IDs).
     # It is only available when the block is full.
@@ -135,6 +136,7 @@ class KVCacheBlock:
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
+    # block的连接选择通过了双向管理
     prev_free_block: Optional["KVCacheBlock"] = None
     next_free_block: Optional["KVCacheBlock"] = None
 
@@ -143,8 +145,9 @@ class KVCacheBlock:
 
     def incr_ref(self):
         self.ref_cnt += 1
-
+    # 添加校验： bug
     def decr_ref(self):
+        assert self.ref_cnt > 0, "The ref_cnt should more then 0"
         self.ref_cnt -= 1
 
     @property
@@ -222,12 +225,15 @@ class FreeKVCacheBlockQueue:
         self.remove(block)
         return block
 
+    # 应该都需要校验：blockId 在当前queue的范围内, remove时，需要清理引用
     def remove(self, block: KVCacheBlock) -> None:
+        
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
         Args:
             block: The block to remove.
         """
+        
         if block.prev_free_block is not None:
             # Link the previous block to the next block.
             block.prev_free_block.next_free_block = block.next_free_block
@@ -265,6 +271,29 @@ class FreeKVCacheBlockQueue:
 
         block.next_free_block = None
         self.num_free_blocks += 1
+
+    def appends(self, blocks: list[KVCacheBlock]) -> None:
+        """Put a block back into the free list and increase
+        num_free_blocks by 1.
+
+        Args:
+            block: The block to append.
+        """
+        
+        if self.free_list_tail is not None:
+            # Link the last block to the new block.
+            self.free_list_tail.next_free_block = blocks[0]
+            blocks[0].prev_free_block = self.free_list_tail 
+        else:
+            # The free list is empty.
+            assert self.free_list_head is None
+            self.free_list_head = blocks[0]
+            blocks[0].prev_free_block = self.free_list_head
+
+        self.free_list_tail = blocks[-1]  
+        self.free_list_tail.next_free_block = None
+
+        self.num_free_blocks += len(blocks)
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.

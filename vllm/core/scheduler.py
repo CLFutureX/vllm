@@ -444,7 +444,7 @@ class Scheduler:
         if (self.scheduler_config.runner_type == "pooling"
                 or self.cache_config.is_attention_free):
             version = "placeholder"
-
+        # 0907 1调度器的内存管理实现
         BlockSpaceManagerImpl = BlockSpaceManager.get_block_space_manager_class(
             version)
 
@@ -457,6 +457,7 @@ class Scheduler:
             num_cpu_blocks //= pipeline_parallel_size
 
         # Create the block space manager.
+        # 0907 4 Engine-> schduler -> block_manager 
         self.block_manager = BlockSpaceManagerImpl(
             block_size=self.cache_config.block_size,
             num_gpu_blocks=num_gpu_blocks,
@@ -1588,7 +1589,7 @@ class Scheduler:
             else:
                 encoder_seq_data = None
                 cross_block_table = None
-
+            # 0907 2从seq_group 中获取seq对应的blockTable
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data

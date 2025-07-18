@@ -118,6 +118,7 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The new allocated blocks.
         """
+        # 记录当前req分配的block的数量
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_new_blocks = num_required_blocks - len(req_blocks)

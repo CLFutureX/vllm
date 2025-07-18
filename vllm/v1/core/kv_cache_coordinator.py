@@ -26,7 +26,7 @@ class KVCacheCoordinator(ABC):
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
-
+        # 同样的block 池
         self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
                                     enable_kv_cache_events)
 

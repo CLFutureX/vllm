@@ -459,6 +459,7 @@ class RayDistributedExecutor(DistributedExecutorBase):
         if self.use_v1:
             output = outputs[0]
         else:
+            # 0907 最终也是调用大模型的decoder解码器
             output = self.output_decoder.decode(outputs[0])
         return output
 
@@ -494,7 +495,8 @@ class RayDistributedExecutor(DistributedExecutorBase):
             raise NotImplementedError(
                 "max_concurrent_workers is not supported yet.")
 
-        # Start the ray workers first.
+        # Start the ray workers first. 
+        # 0907 调用works执行，并收集执行结果
         ray_workers = self.workers
         if async_run_tensor_parallel_workers_only:
             ray_workers = self.non_driver_workers
