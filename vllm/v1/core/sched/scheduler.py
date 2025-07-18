@@ -164,6 +164,7 @@ class Scheduler(SchedulerInterface):
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
+        # 包含推测 生成的总tok
         # num_tokens_with_spec. num_tokens_with_spec =
         # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).
         # At each step, the scheduler tries to assign tokens to the requests
@@ -171,10 +172,13 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
+        # 存放新的-首次被调度的请求
         scheduled_new_reqs: list[Request] = []
+        # 存放被暂停后恢复执行的请求-从preempted_reqs中恢复执行的请求，可能会再次因为内存不足而被暂停
         scheduled_resumed_reqs: list[Request] = []
+        # 存放正在执行推理的请求，优先处理此列表中的请求
         scheduled_running_reqs: list[Request] = []
+        # 存储被抢占资源的请求，系统资源不足时，低优先级或长时间运行的请求会被放入此列表
         preempted_reqs: list[Request] = []
 
         # NOTE: structured_output_request_ids maps
@@ -182,16 +186,21 @@ class Scheduler(SchedulerInterface):
         # request_id to the running request index.
         # This will helps us determine to slice the grammar bitmask
         # and only applies valid mask for requests that
-        # uses structured decoding.
+        # uses structured decoding. 
+        # 结构化输出列表，req_id, 到scheduled_running_reqs的下标映射
         structured_output_request_ids: dict[str, int] = {}
-
+        # req_id 到 分片的kvblock的id
         req_to_new_block_ids: dict[str, tuple[list[int], ...]] = {}
+        # 每个请求已调度的令牌数量
         num_scheduled_tokens: dict[str, int] = {}
+        # 令牌调度的资源上限
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
+        # 编码器的输入ID
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
+        # 每个req的推测解码令牌
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         # For logging.
@@ -199,7 +208,7 @@ class Scheduler(SchedulerInterface):
         # 基于资源进行决策 - 仅最大可能利用资源
         # First, schedule the RUNNING requests.
         # 1 首先调度 运行中的 请求
-        req_index = 0
+        req_index = 0 
         while req_index < len(self.running) and token_budget > 0:
             # 从左到右遍历running队列的请求
             request = self.running[req_index]
@@ -241,7 +250,9 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
-            # 计算推测解码的token数： 减去原始的token数就等于 推测解码的token数了。
+            # 计算推测解码的token数： 减去原始的token数就等于 
+            # num_tokens 代表当前这个req已经生成的token（prompt， 已生成的输出，以及推测的令牌）
+            # 使用新分配的tokens + 已经计算的 - 所有的，就代表需要 推测解码中需要生成的草稿tokens了
             num_draft_tokens = max(
                 num_new_tokens + request.num_computed_tokens -
                 request.num_tokens, 0)
@@ -253,12 +264,12 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens=num_draft_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens)
                 # 分配blocks失败时，根据抢占策略进行抢占
-                if new_blocks is None:
+                if new_blocks is None: 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
-                            self.running,
+                            self.running[req_index:],
                             key=lambda r: (r.priority, r.arrival_time),
                         ) 
                     else:
