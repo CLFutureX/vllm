@@ -196,6 +196,7 @@ class EngineCore:
         req = Request.from_engine_core_request(request)
         if req.use_structured_output:
             # Start grammar compilation asynchronously
+            # 结构化输出
             self.structured_output_manager.grammar_init(req)
 
         if req.kv_transfer_params is not None and (

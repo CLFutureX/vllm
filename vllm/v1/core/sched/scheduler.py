@@ -39,6 +39,11 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    
+    class Action(Enum):
+        EXIT = 0      
+        CONTINUE = 1  
+        PASS = 2      
 
     def __init__(
         self,
@@ -210,6 +215,7 @@ class Scheduler(SchedulerInterface):
         # 基于资源进行决策 - 仅最大可能利用资源
         # First, schedule the RUNNING requests.
         # 1 首先调度 运行中的 请求
+        # 应该直接对running 进行优先级判断。或者为什么不直接对running作为优先级的
         req_index = 0 
         while req_index < len(self.running) and token_budget > 0:
             # 从左到右遍历running队列的请求
@@ -278,9 +284,11 @@ class Scheduler(SchedulerInterface):
                     #4  这样下一次就可以直接进行调度了，而不是需要重新进行调度。 也不是
                     # 下一次会循环进行分配， 问题 也即是没有更新token_budget。这也是个bug
                     # 然后应该先淘汰后面中，优先级低的。 不存在更低的时候
-                    # 将全局最低的判断，如果已经被分配，那么可以将其从running中移动到最后，
+                    # 将全局最低的判断，如果已经被分配，那么可以将其从running中移动到最后，-- 调整为将running结束之后，进行优先级重排即可。
+                    # 
                     # 下一次被延迟调度
                     if self.policy == SchedulingPolicy.PRIORITY:
+                        # 
                         preempted_req = max(
                             self.running[req_index:],
                             key=lambda r: (r.priority, r.arrival_time),
@@ -288,6 +296,31 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running[-1]
                         
+                    if preempted_req == request:
+                        if preempted_req == self.running[-1]:
+                            # 直接退出，不清理缓存
+                            can_schedule = 0
+                            break
+                        # 淘汰自己，进入下一次
+                        self.running.remove(preempted_req)
+                        self.kv_cache_manager.free(preempted_req)
+                        preempted_req.status = RequestStatus.PREEMPTED
+                        preempted_req.num_computed_tokens = 0
+                        if self.log_stats:
+                            preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                        self.waiting.prepend_request(preempted_req)
+                        preempted_reqs.append(preempted_req)
+                        can_schedule = 1
+                        break
+                    else:
+                        # 淘汰低优先级请求 
+                    # 筛选之后，进行释放 - 会不会存在，释放之后，还不够的情况，其实也存在
+                    
+                    
+
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
                     # 选择优先级最低的进行淘汰，且自己不是优先级最高的哪个，释放之后，应该继续进行。
                     # 淘汰之后，进行调度，也没有给新的req分配block资源
                     if preempted_req == request:
@@ -319,8 +352,10 @@ class Scheduler(SchedulerInterface):
                     can_schedule = True
                     break
             # 退出当前for循环 
-            if not can_schedule:
+            if  can_schedule == 0:
                 break
+            elif can_schedule == 1:
+                continue
             assert new_blocks is not None
 
             # Schedule the request. - 后面会被抢占
@@ -523,8 +558,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 if request.use_structured_output:
-                    structured_output_request_ids[request.request_id] = (
-                        req_index)
+                    structured_output_request_ids[request.request_id] = (len(structured_output_request_ids) + 1
+                                                                         )
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
@@ -596,6 +631,8 @@ class Scheduler(SchedulerInterface):
                                         req_to_new_block_ids[req.request_id])
             for req in scheduled_new_reqs
         ]
+        # scheduled_running_reqs， scheduled_resumed_reqs都是被执行过的，都会有对应的缓存了。
+        # 封装成cache_req
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -706,6 +743,7 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens.append(req.num_computed_tokens)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
+        # 存储是否经过了重新调度，
         resumed_from_preemption = [False] * len(running_reqs)
         resumed_from_preemption += [True] * len(resumed_reqs)
 
@@ -1083,7 +1121,19 @@ class Scheduler(SchedulerInterface):
         for request in valid_requests:
             request.status = finished_status
             self._free_request(request)
-
+    
+    def _preempted_req(self, request: Request):
+        self.running.remove(request)
+        self.kv_cache_manager.free(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        if self.log_stats:
+            request.record_event(
+                EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+        self.waiting.prepend_request(preempted_req)
+        
+                        
+    
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
 

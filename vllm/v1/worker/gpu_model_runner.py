@@ -363,6 +363,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         new/resumed/paused/finished request in the batch.
         """
         # Remove finished requests from the cached states.
+        # 移除已完成的请求
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
@@ -373,9 +374,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
+            # 从批量中移除req请求
             self.input_batch.remove_request(req_id)
 
-        # Free the cached encoder outputs.
+        # Free the cached encoder outputs. 释放缓存的编码输出
         for req_id, input_id in scheduler_output.free_encoder_input_ids:
             encoder_outputs = self.encoder_cache.get(req_id)
             if encoder_outputs is not None:
@@ -388,18 +390,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # or running requests that are not scheduled in this step. We remove
         # them from the persistent batch but keep their cached states since
         # they will be scheduled again sometime in the future.
+        # 命中调度的请求id <-> token 数
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+        # 当前批次存在的请求id
         cached_req_ids = self.input_batch.req_id_to_index.keys()
+        # 当前批次未被调度的请求id
         unscheduled_req_ids = cached_req_ids - scheduled_req_ids
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
+            # 从批次中移除此请求id
             self.input_batch.remove_request(req_id)
 
         req_ids_to_add: list[str] = []
         # Add new requests to the cached states.
+        # 新增加的请求
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
@@ -461,15 +468,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         audio_feature_lengths=audio_feature_lengths,
                         use_audio_in_video=use_audio_in_video,
                     )
-
+            # 记录新增加的请求
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
+        # 获取请求
         req_data = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
+            # 新的gpu block块
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
 
@@ -492,7 +501,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_state.output_token_ids.extend(
                         new_token_ids[-num_new_tokens:])
 
-            # Update the block IDs.
+            # Update the block IDs. 更新block_ids 块
             if not resumed_from_preemption:
                 # Append the new blocks to the existing block IDs.
                 for block_ids, new_ids in zip(req_state.block_ids,
@@ -501,8 +510,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
+                # 如果被抢占过，那么就直接=newBlockids
                 req_state.block_ids = new_block_ids
-
+            # req_id 在batch中的下标
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -545,6 +555,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # The smaller empty indices are filled first.
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
+            # 增加请求到batch中
             self.input_batch.add_request(req_state)
 
         # Condense the batched states if there are gaps left by removed requests

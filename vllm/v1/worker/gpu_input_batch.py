@@ -83,6 +83,7 @@ class InputBatch:
             logits_processing_needs_token_ids)
 
         self._req_ids: list[Optional[str]] = []
+        
         self.req_id_to_index: dict[str, int] = {}
 
         # TODO(woosuk): This buffer could be too large if max_model_len is big.
