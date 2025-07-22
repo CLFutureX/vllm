@@ -55,6 +55,7 @@ class Scheduler(SchedulerInterface):
         self.lora_config = vllm_config.lora_config
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
+        self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
 
@@ -87,7 +88,7 @@ class Scheduler(SchedulerInterface):
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
-            vllm_config.parallel_config.data_parallel_rank,
+            self.parallel_config.data_parallel_rank,
         )
 
         num_gpu_blocks = self.cache_config.num_gpu_blocks
@@ -159,6 +160,7 @@ class Scheduler(SchedulerInterface):
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
+        self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -212,8 +214,9 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             # 从左到右遍历running队列的请求
             request = self.running[req_index]
-            # 计算每个请求剩余需要的token空间
-            num_new_tokens = (request.num_tokens_with_spec -
+            # 计算每个请求剩余需要的token空间 + 预占用 - 已经计算的，代表需要新分配的tokens
+            num_new_tokens = (request.num_tokens_with_spec +
+                              request.num_output_placeholders -
                               request.num_computed_tokens)
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
@@ -226,7 +229,7 @@ class Scheduler(SchedulerInterface):
             # 不能超过模型的长度限制
             num_new_tokens = min(
                 num_new_tokens,
-                self.max_model_len - request.num_computed_tokens)
+                self.max_model_len - 1 - request.num_computed_tokens)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -240,9 +243,11 @@ class Scheduler(SchedulerInterface):
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
-                # 1. No new tokens to schedule. This may happen when PP>1 and
-                #    we have already scheduled all prompt tokens but they are
-                #    not finished yet.
+                # 1. No new tokens to schedule. This may happen when
+                #    (1) PP>1 and we have already scheduled all prompt tokens
+                #    but they are not finished yet.
+                #    (2) Async scheduling and the request has reached to either
+                #    its max_total_tokens or max_model_len.
                 # 2. The encoder budget is exhausted.
                 # 3. The encoder cache is exhausted.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
@@ -253,34 +258,44 @@ class Scheduler(SchedulerInterface):
             # 计算推测解码的token数： 减去原始的token数就等于 
             # num_tokens 代表当前这个req已经生成的token（prompt， 已生成的输出，以及推测的令牌）
             # 使用新分配的tokens + 已经计算的 - 所有的，就代表需要 推测解码中需要生成的草稿tokens了
-            num_draft_tokens = max(
-                num_new_tokens + request.num_computed_tokens -
-                request.num_tokens, 0)
-            # 分配资源- 在调度时才进行分配资源是正确的
+            # num_draft_tokens = max(
+            #     num_new_tokens + request.num_computed_tokens -
+            #     request.num_tokens, 0)
+            # # 分配资源- 在调度时才进行分配资源是正确的
+
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
-                    num_draft_tokens=num_draft_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens)
                 # 分配blocks失败时，根据抢占策略进行抢占
                 if new_blocks is None: 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
+                    #1  获取优先级最低的进行直接淘汰？ 淘汰之后就直接加入到waiting中
+                    #2  重新分配之后，大概率存在新的可分配的内存。
+                    #3  只要存在淘汰就会停止调度了。 等待下一次被调度， 当前仅仅是移动req，
+                    #4  这样下一次就可以直接进行调度了，而不是需要重新进行调度。 也不是
+                    # 下一次会循环进行分配， 问题 也即是没有更新token_budget。这也是个bug
+                    # 然后应该先淘汰后面中，优先级低的。 不存在更低的时候
+                    # 将全局最低的判断，如果已经被分配，那么可以将其从running中移动到最后，
+                    # 下一次被延迟调度
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running[req_index:],
                             key=lambda r: (r.priority, r.arrival_time),
-                        ) 
+                        )
                     else:
                         preempted_req = self.running[-1]
-
+                        
+                    # 选择优先级最低的进行淘汰，且自己不是优先级最高的哪个，释放之后，应该继续进行。
+                    # 淘汰之后，进行调度，也没有给新的req分配block资源
                     if preempted_req == request:
                         can_schedule = False
                         break
                     self.running.remove(preempted_req)
                     scheduled_running_reqs.remove(preempted_req)
-                    # 筛选之后，进行释放 - 会不会存在，释放之后，还不够的情况
+                    # 筛选之后，进行释放 - 会不会存在，释放之后，还不够的情况，其实也存在
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
@@ -290,10 +305,12 @@ class Scheduler(SchedulerInterface):
 
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
+                    # 抢占自己？自己就是优先级最低的， 那就不需要释放
                     if preempted_req == request:
                         # 如果当前的请求已经是优先级最低了，那么就中断抢占， - 反之如果
                         # 将自己淘汰了的话，此时可能才会有空间给其他人调度。
-                        # 这里是不是应该提前判断，如果是自己的话，则不进行抢占，显然会更好。
+                        # 这里是不是应该提前判断，如果是自己的话，则不进行抢占，显然会更好， 自己就是运行中最低的请求
+                        # 释放之后，后面的其他请求可能可以被调度呀。
                         # No more request to preempt.
                         can_schedule = False
                         break
@@ -341,7 +358,7 @@ class Scheduler(SchedulerInterface):
                 for i in encoder_inputs_to_schedule:
                     self.encoder_cache_manager.allocate(request, i)
                 encoder_budget = new_encoder_budget
-
+##############################running中的调度完成##########################
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -355,8 +372,14 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        # 调度等待中的请求
-        if not preempted_reqs:
+        # 没有抢占，不存在prer_req,则会尝试调度等待中的请求
+        # 可能存在供被调度的资源，不应该通过这个来判断是否进行调度
+        # 或许想表达的是，当不存在被淘汰的请求时，会认为可能存在多个的可用资源。
+        # 但需要考虑的是，前面被淘汰了一个大请求之后，存在了可用的资源。
+        # 可以进行调度了。 如果前面产生了淘汰，那么这里大概率也不会成功了，于是选择直接返回
+        # 获取设置一个阈值，如果token_budget > 某一个阈值，此时也可以尝试调度
+        # 其实也要考虑优先级？
+        if not preempted_reqs or token_budget > 1024:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -611,6 +634,13 @@ class Scheduler(SchedulerInterface):
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+        self._update_after_schedule(scheduler_output)
+        return scheduler_output
+
+    def _update_after_schedule(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -620,11 +650,24 @@ class Scheduler(SchedulerInterface):
         #    scheduling step.
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
-            self.requests[req_id].num_computed_tokens += num_scheduled_token
+            request = self.requests[req_id]
+            # 加上实际完成调度的数量，仅此而已，对应的blcok占用持续存在
+            request.num_computed_tokens += num_scheduled_token
 
+            # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
+            # may be updated again in _update_from_output for speculative
+            # decoding. However, it is safe to call the method here because
+            # encoder inputs are always part of the prompt, not the output,
+            # and thus are unaffected by speculative decoding.
+            if request.has_encoder_inputs:
+                self._free_encoder_inputs(request)
+
+        # Clear the finished request IDs.
+        # NOTE: We shouldn't do self.finished_req_ids.clear() here because
+        # it will also affect the scheduler output.
         self.finished_req_ids = set()
-        return scheduler_output
 
     def _make_cached_request_data(
         self,
@@ -639,14 +682,26 @@ class Scheduler(SchedulerInterface):
         new_block_ids: list[tuple[list[int], ...]] = []
         num_computed_tokens: list[int] = []
 
+        use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
             req_id = req.request_id
             req_ids.append(req_id)
             num_tokens = (num_scheduled_tokens[req_id] -
                           len(spec_decode_tokens.get(req_id, ())))
-            token_ids = req.all_token_ids[req.num_computed_tokens:req.
-                                          num_computed_tokens + num_tokens]
-            new_token_ids.append(token_ids)
+            if self.use_pp:
+                # When using PP, the scheduler sends the sampled tokens back,
+                # because there's no direct communication between the first-
+                # stage worker and the last-stage worker. Otherwise, we don't
+                # need to send the sampled tokens back because the model runner
+                # will cache them.
+                token_ids = req.all_token_ids[req.num_computed_tokens:req.
+                                              num_computed_tokens + num_tokens]
+                new_token_ids.append(token_ids)
+            elif use_connector:
+                # When using a KVConnector, we add a placeholder to avoid index
+                # out of bounds errors. TODO: Remove this once the KVConnector
+                # is updated to handle token IDs properly.
+                new_token_ids.append([])
             new_block_ids.append(req_to_new_block_ids[req_id])
             num_computed_tokens.append(req.num_computed_tokens)
         # Because resumed_reqs is usually empty, it is more efficient to do
@@ -758,19 +813,21 @@ class Scheduler(SchedulerInterface):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
 
-        new_running: list[Request] = []
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
 
-        # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
-        # loop can be a performance bottleneck. We should do our best to avoid
-        # expensive operations inside the loop.
-        for request in self.running:
-            req_id = request.request_id
-            num_tokens_scheduled = num_scheduled_tokens.get(req_id, 0)
-            if num_tokens_scheduled == 0:
-                # The request was not scheduled in this step.
-                new_running.append(request)
+        # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
+        # the below loop can be a performance bottleneck. We should do our best
+        # to avoid expensive operations inside the loop.
+        stopped_running_reqs: set[Request] = set()
+        stopped_preempted_reqs: set[Request] = set()
+        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            assert num_tokens_scheduled > 0
+            request = self.requests.get(req_id)
+            if request is None:
+                # The request is already finished. This can happen if the
+                # request is aborted while the model is executing it (e.g.,
+                # in pipeline parallelism).
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
@@ -796,48 +853,48 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens=len(scheduled_spec_token_ids),
                     num_accepted_tokens=len(generated_token_ids) - 1)
 
-            cached_encoder_input_ids = (
-                self.encoder_cache_manager.get_cached_input_ids(request))
-            # OPTIMIZATION: Avoid list(set) if the set is empty.
-            if cached_encoder_input_ids:
-                for input_id in list(cached_encoder_input_ids):
-                    mm_positions = request.mm_positions[input_id]
-                    start_pos = mm_positions.offset
-                    num_tokens = mm_positions.length
-                    if start_pos + num_tokens <= request.num_computed_tokens:
-                        # The encoder output is already processed and stored
-                        # in the decoder's KV cache.
-                        self.encoder_cache_manager.free_encoder_input(
-                            request, input_id)
-
             stopped = False
             new_logprobs = None
             new_token_ids = generated_token_ids
             kv_transfer_params = None
+            status_before_stop = request.status
 
-            # Append generated tokens and check for stop. Note that if
-            # a request is still being prefilled, we expect the model runner
-            # to return empty token ids for the request.
-            for num_new, output_token_id in enumerate(new_token_ids, 1):
-                request.append_output_token_ids(output_token_id)
+# <<<<<<< HEAD
+#             # Append generated tokens and check for stop. Note that if
+#             # a request is still being prefilled, we expect the model runner
+#             # to return empty token ids for the request.
+#             for num_new, output_token_id in enumerate(new_token_ids, 1):
+#                 request.append_output_token_ids(output_token_id)
 
-                # Check for stop and update request state.
-                # This must be called before we make the EngineCoreOutput.
-                # 是否需要被终止：超过了最大长度- 模型最大支持长度，或者请求的token已经达到允许的最大参数
-                stopped = check_stop(request, self.max_model_len)
-                if stopped:
-                    # 达到之后，释放请求
-                    kv_transfer_params = self._free_request(request)
-                    del new_token_ids[num_new:]  # Trim new tokens if needed.
-                    break
+#                 # Check for stop and update request state.
+#                 # This must be called before we make the EngineCoreOutput.
+#                 # 是否需要被终止：超过了最大长度- 模型最大支持长度，或者请求的token已经达到允许的最大参数
+#                 stopped = check_stop(request, self.max_model_len)
+#                 if stopped:
+#                     # 达到之后，释放请求
+#                     kv_transfer_params = self._free_request(request)
+#                     del new_token_ids[num_new:]  # Trim new tokens if needed.
+#                     break
+# =======
+            # Check for stop and update request status.
+            if new_token_ids:
+                new_token_ids, stopped = self._update_request_with_output(
+                    request, new_token_ids)
+ 
 
+            # Stop checking for pooler models.
             pooler_output = None
             if pooler_outputs:
                 pooler_output = pooler_outputs[req_index]
                 stopped = check_stop(request, self.max_model_len,
                                      pooler_output)
-                if stopped:
-                    kv_transfer_params = self._free_request(request)
+
+            if stopped:
+                kv_transfer_params = self._free_request(request)
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if request.sampling_params is not None \
@@ -892,9 +949,14 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
-            if not stopped:
-                new_running.append(request)
-        self.running = new_running
+        # Remove the stopped requests from the running and waiting queues.
+        if stopped_running_reqs:
+            self.running = [
+                req for req in self.running if req not in stopped_running_reqs
+            ]
+        if stopped_preempted_reqs:
+            # This is a rare case and unlikely to impact performance.
+            self.waiting.remove_requests(stopped_preempted_reqs)
 
         # KV Connector: update state for finished KV Transfers.
         self._update_from_kv_xfer_finished(model_runner_output)
@@ -925,6 +987,45 @@ class Scheduler(SchedulerInterface):
                 self.make_stats(spec_decoding_stats))
 
         return engine_core_outputs
+
+    def _update_request_with_output(
+        self,
+        request: Request,
+        new_token_ids: list[int],
+    ) -> tuple[list[int], bool]:
+        # Append generated tokens and check for stop. Note that if
+        # a request is still being prefilled, we expect the model runner
+        # to return empty token ids for the request.
+        stopped = False
+        for num_new, output_token_id in enumerate(new_token_ids, 1):
+            request.append_output_token_ids(output_token_id)
+
+            # Check for stop and update request state.
+            # This must be called before we make the EngineCoreOutput.
+            stopped = check_stop(request, self.max_model_len)
+            if stopped:
+                del new_token_ids[num_new:]  # Trim new tokens if needed.
+                break
+        return new_token_ids, stopped
+
+    def _free_encoder_inputs(self, request: Request) -> None:
+        cached_encoder_input_ids = (
+            self.encoder_cache_manager.get_cached_input_ids(request))
+        # OPTIMIZATION: Avoid list(set) if the set is empty.
+        if not cached_encoder_input_ids:
+            return
+
+        # Here, we use list(set) to avoid modifying the set while iterating
+        # over it.
+        for input_id in list(cached_encoder_input_ids):
+            mm_positions = request.mm_positions[input_id]
+            start_pos = mm_positions.offset
+            num_tokens = mm_positions.length
+            if start_pos + num_tokens <= request.num_computed_tokens:
+                # The encoder output is already processed and stored
+                # in the decoder's KV cache.
+                self.encoder_cache_manager.free_encoder_input(
+                    request, input_id)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
