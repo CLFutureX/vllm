@@ -844,9 +844,10 @@ class Scheduler(SchedulerInterface):
                 # num_computed_tokens is decreased by the number of rejected
                 # tokens, where is given by:
                 # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
-                # 计算应该生成的token数 - 已经生成的= 还需要生成的
+                # 计算应该生成的token数 - 已经生成的=未生成的token数
                 num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
                                        len(generated_token_ids))
+                # 减去未生成的token数
                 request.num_computed_tokens -= num_tokens_rejected
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
