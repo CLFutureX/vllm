@@ -1336,3 +1336,50 @@ def test_eagle_with_sliding_window():
     # there will be no matched prefix.
     assert len(computed_blocks.blocks[0]) == 0
     assert num_tokens == 0
+
+
+def test_delay_free_blocks():
+    """Test delay free blocks"""
+    block_pool = BlockPool(
+        num_gpu_blocks=6,
+        delay_batch_size=16,
+        enable_caching=True,
+    )
+
+    assert block_pool.check_blocks_enough(6)
+    # blocks:
+    #  list[0]: block0
+    #  list[1] : block1 block2
+    #  list[2] : block3 block4 block5
+    blocks: list[list[KVCacheBlock]] = []
+    blocks.append(block_pool.get_new_blocks(1))
+    blocks.append(block_pool.get_new_blocks(2))
+    blocks.append(block_pool.get_new_blocks(3))
+
+    for item in range(blocks):
+        block_pool.free_blocks(item)
+    assert len(block_pool.delay_free_blocks) == 3
+    assert len(block_pool.delay_free_blocks[2]) == 3
+
+    assert block_pool.check_blocks_enough(6)
+
+    block_ids = [5, 2, 4, 0, 1, 3]
+    cur_blocks = block_pool.get_new_blocks(6)
+    for i in range(len(cur_blocks)):
+        assert block_ids[i] == cur_blocks[i].block_id
+
+    block_pool = BlockPool(
+        num_gpu_blocks=6,
+        delay_batch_size=4,
+        enable_caching=True,
+    )
+
+    blocks.clear()
+    blocks.append(block_pool.get_new_blocks(1))
+    blocks.append(block_pool.get_new_blocks(3))
+
+    for item in range(blocks):
+        block_pool.free_blocks(item)
+
+    assert len(block_pool.delay_free_blocks) == 0
+    assert block_pool.get_num_free_blocks() == 6

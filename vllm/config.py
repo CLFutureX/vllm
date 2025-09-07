@@ -1683,6 +1683,8 @@ class CacheConfig:
     """The number of blocks to allocate for GPU memory."""
     num_cpu_blocks: Optional[int] = field(default=None, init=False)
     """The number of blocks to allocate for CPU memory."""
+    delay_batch_size: int = 16
+    """The batch size of the delayed release"""
 
     def compute_hash(self) -> str:
         """

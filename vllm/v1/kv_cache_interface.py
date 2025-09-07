@@ -251,6 +251,10 @@ class KVCacheConfig:
     """
     """The number of KV cache blocks"""
     num_blocks: int
+    """
+    The batch size of the delayed release
+    """
+    delay_batch_size: int = 16
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_tensors: list[KVCacheTensor]
     """

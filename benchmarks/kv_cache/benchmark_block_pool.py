@@ -41,7 +41,7 @@ def main(args):
             t1 = time.monotonic_ns()
             blocks = block_pool.get_new_blocks(allocate_block)
             t2 = time.monotonic_ns()
-            block_pool.free_blocks(blocks)
+            block_pool.free_blocks(blocks, False)
             t3 = time.monotonic_ns()
             get_blocks_metric.update(t2 - t1)
             free_blocks_metric.update(t3 - t2)
