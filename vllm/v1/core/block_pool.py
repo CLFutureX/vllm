@@ -359,8 +359,7 @@ class BlockPool:
             False otherwise.
         """
         return self.get_num_free_blocks(
-        ) >= needBlocks or self.get_num_free_blocks(
-                refresh=True) >= needBlocks
+        ) >= needBlocks or self.get_num_free_blocks(refresh=True) >= needBlocks
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
